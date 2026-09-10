@@ -1,173 +1,120 @@
 ---
 name: inventory-tracking
-description: "Track and update hotel inventory in the Google Sheets inventory tracker from casual conversation — no tool name needed. Trigger when the owner mentions stock or supplies: 'add 5 bath towels to the laundry room', 'we got a delivery of paper towels', 'we used 3 rolls', 'set the coffee cups to 40', 'we have 12 plates now', 'how many towels do we have', 'what's running low', 'restock the breakfast items', 'take inventory', 'count the pool supplies', 'log that shipment', 'update stock'. A required first-time setup links the property's Google Sheet (created from the approved inventory template) before any write; Kolo validates access and structure and never guesses which spreadsheet to use."
-version: 1.1.0
+description: "Track hotel inventory in the linked Google Sheets template from casual conversation. Triggers on stock/supply talk ('add 5 bath towels', 'we used 3 rolls', 'how many do we have', 'what's running low'). Requires first-time per-property sheet setup before any write; a deterministic engine performs matching, quantity math, write verification, and concurrency control."
+version: 1.2.0
 tags: [inventory, stock, google-sheets, hotel, supplies, setup]
 ---
 
 # Inventory Tracking
 
-Track hotel inventory in the Google Sheets inventory template. The owner
-describes inventory changes in plain English; you resolve the property and
-location, match the item, update its quantity in the linked sheet, and confirm
-in one line.
+A deterministic engine (`tools/inventory.py`) owns every inventory change.
+Your only job is to map the owner's words to one subcommand and relay the
+result. Never hand-edit the sheet, never guess a spreadsheet, never guess an
+item.
 
-## First rule: never guess the spreadsheet
-
-There is **no hardcoded/default spreadsheet**. Inventory is always tracked in a
-sheet the owner has explicitly linked for a specific property/location. If no
-linked sheet exists for the property in question (and the prompt does not
-itself supply a fresh `docs.google.com/spreadsheets/d/<ID>` link), **do not
-update anything** — run first-time setup and ask for the link. Guessing a
-spreadsheet ID is the failure mode this skill exists to prevent.
-
-## The per-property tracker (governed records)
-
-Each property's linked sheet is stored as a governed record:
-
-- **record-type:** `skill.inventory-tracking`
-- **external-id:** the property slug (lowercase, kebab-case — e.g. `sunrise-inn`,
-  `main-hotel`, `north-tower`)
-
-The record `payload` holds:
-
-```json
-{
-  "spreadsheet_id": "<ID>",
-  "title": "<sheet title>",
-  "property": "<human property/location name>",
-  "tabs": ["1st Floor Storage ", "Breakfast Items ", "..."],
-  "sheet_lineage": "approved inventory template"
-}
-```
-
-Read the tracker for a property before every request:
+Run every command from this skill's directory:
 
 ```bash
-kolo record-list --record-type skill.inventory-tracking
-# then, for the one property you need:
-kolo record-get --record-type skill.inventory-tracking --external-id <property-slug>
+python3 tools/inventory.py <subcommand> [flags]
 ```
 
-`record-list` returns metadata only; use `record-get` for the full payload.
-If the property has no record, you must run setup — there is nothing to write
-against and nothing to fall back to.
+All output is one line of JSON. Read its `state`, not the exit code:
 
-## First-time setup (required before any write)
+- `confirmed` → report `message`.
+- `awaiting_operator` → ask the owner the `question` (one short question) and stop.
+- `uncertain` → run `reconcile --action-id <id>` before retrying.
+- `attempting` → transient; wait for the lease, then re-check or `reconcile`.
 
-If the resolved property has no linked tracker (or the prompt points at a sheet
-you have never validated), walk setup one step at a time. **No inventory write
-happens until setup completes.**
+## Golden rules
 
-1. **Ask for the link.** Ask the owner for the Google Sheets link for the
-   spreadsheet they created from the **approved inventory template**, and which
-   property/location it is for. That is the one actionable question — ask it and
-   stop. Do not go hunting through Drive and pick a sheet yourself.
-2. **Resolve the property slug.** Turn the property/location they name into a
-   stable kebab-case slug for `--external-id`.
-3. **Extract the ID.** Take the segment after `/spreadsheets/d/` from the link.
-4. **Validate access.** Resolve routing (`kolo integration-routing`), then read
-   spreadsheet metadata and the sheet list through the gateway (below). A 403 or
-   "no active connection" means Kolo cannot reach the sheet for this account —
-   explain and guide the owner to **Settings → Integrations → Connect Google**,
-   then stop. A 404 means the link is wrong or the sheet was moved/deleted.
-5. **Validate structure.** Confirm each expected location tab exists and that
-   **Column A = item name, Column B = quantity on hand**, with a header row 1.
-   The approved template's tabs are:
-   `1st Floor Storage `, `Breakfast Items `, `Laundry Room`, `Maintenance Room`,
-   `Pool Supplies `, `2nd Floor Stoage 1`, `2nd Floor Storage 2`,
-   `3rd Floor Storage 1`, `3rd Floor Storage 2`, `4th Floor Storage 1`,
-   `4th Floor Storage 2`. If tabs or the A/B column layout do not match the
-   template, do not proceed — tell the owner what is off and ask them to fix the
-   sheet (or confirm a corrected link).
-6. **Save the tracker.**
+- Never guess a spreadsheet or an item.
+- No write without an **active** tracker; a pending setup is read/write-blocked.
+- Every action is journaled and idempotent; the engine re-reads after every
+  write to verify before it ever reports success.
+- A quantity that would go negative, an ambiguous item, or a unit mismatch is
+  returned as `awaiting_operator` — relay the question and wait, never decide.
+
+## First-time setup (two-phase, per property)
+
+1. Owner names a property and pastes its Google Sheets link (created from the
+   approved inventory template):
+
+   ```bash
+   python3 tools/inventory.py setup --sheet-id "<id or link>" --property "Sunrise Inn"
+   ```
+
+   This validates access and structure against the template and stores a
+   **pending** tracker. An inaccessible sheet, a wrong/moved link, or tabs/
+   columns that don't match the template each return an explanation and one
+   actionable question — never a guess.
+
+2. Owner confirms → activate; owner declines → discard:
+
+   ```bash
+   python3 tools/inventory.py confirm --property-id <id>
+   python3 tools/inventory.py reject --property-id <id>
+   ```
+
+   After `confirm`, echo the property + sheet title + tab list. Trackers are
+   stored as Kolo `skill.inventory-tracking` records; routing and credentials
+   are resolved by the engine at runtime, so nothing account- or
+   gateway-specific lives in this file.
+
+## Daily use
+
+| Owner says | Command |
+|---|---|
+| "set X to N" / "we have N X" | `apply --item X --op set --spec N [--tab loc]` |
+| "add N X" / "got a delivery of N X" | `apply --item X --op add --spec N [--tab loc]` |
+| "use/remove N X" / "sold N X" | `apply --item X --op subtract --spec N [--tab loc]` |
+| "how many X" / "what's in <loc>" | `query [--item X] [--tab loc]` |
+| "what's running low" | `query --low` |
+
+`--spec` takes `"5"`, `"5 rolls"`, or `"rolls 5"` (amount plus optional unit).
+Use `--amount 5 --unit rolls` as an alternative. Omit `--tab` when the item
+lives in one location; if the item appears in several tabs the engine asks
+which one. `--property-id` is optional when exactly one active tracker exists;
+otherwise resolve it with `list-trackers` and pass it explicitly.
+
+## Tracker management
 
 ```bash
-kolo record-upsert --record-type skill.inventory-tracking --external-id <property-slug> \
-  --status active \
-  --payload '{"spreadsheet_id":"<ID>","title":"<sheet title>","property":"<human name>","tabs":[...]}'
+python3 tools/inventory.py list-trackers
+python3 tools/inventory.py relink --property-id <id> --sheet-id "<new sheet>"  # pending until confirm
+python3 tools/inventory.py rename --property-id <id> --name "New Name"
+python3 tools/inventory.py deactivate --property-id <id>   # soft; add --confirm to apply
+python3 tools/inventory.py remove-tracker --property-id <id>  # destructive; add --confirm
 ```
 
-7. **Confirm before accepting updates.** Echo back the linked property/location
-   and the sheet title (with its tab list) and get an explicit "yes" that this
-   is the right sheet for that property. Only then is setup complete and the
-   tracker live for future requests.
+`deactivate` and `remove-tracker` are dry runs without `--confirm`; run with
+`--confirm` only after the owner explicitly approves.
 
-## Routing
+## Readiness
 
-Resolve the Google Sheets access path with `kolo integration-routing`. For this
-owner Google Sheets routes through the **Maton gateway** (see the `api-gateway`
-skill for full mechanics). All calls below use that path with
-`Authorization: Bearer $MATON_API_KEY`. If a routing row instead names `gws`,
-use `gws sheets` equivalents.
+```bash
+python3 tools/inventory.py doctor
+```
+
+Read-only check: Python version, Kolo CLI, routing, credentials, record store,
+and each tracker's sheet. Use before a session of writes; if `status` is
+`not-ready`, fix the named check (or re-run setup for a drifted sheet) before
+writing.
+
+## Before writing — two checks
+
+1. `doctor` returns `ready`.
+2. The property has an **active** tracker (`list-trackers`); none for this
+   property → run setup (ask for the link) and stop.
+
+## Errors & questions
+
+- No active tracker for the property → setup (ask for the link) and stop.
+- Sheet 403 → owner reconnects (Settings → Integrations); 404 → corrected link.
+- Structure/tabs/columns mismatch → the engine says exactly what is off; re-run setup.
+- Ambiguous or would-go-negative → relay the engine's question; never decide.
 
 ## Approval
 
-Updating the owner's own inventory sheet at their direct request is the whole
-point of this skill — the prompt itself is the instruction, so inventory
-read/write to a **linked, validated** tracker runs directly without a separate
-strategic brief. Any other sheet, an unvalidated link, or any outbound action
-(ordering, emailing a vendor) still follows the normal approval flow.
-
-## Workflow
-
-1. **Resolve the property and tracker.** If the prompt names a property, look up
-   `kolo record-get --record-type skill.inventory-tracking --external-id <slug>`.
-   If the prompt supplies a `docs.google.com/spreadsheets/d/<ID>` link for a
-   property with no tracker, that link is a *candidate* — run setup validation on
-   it before writing, never accept it blind. If there is exactly one configured
-   property and the prompt doesn't say otherwise, use it. If there are several
-   and the prompt is ambiguous, ask which property — don't guess. **No tracker
-   for the property → run setup (ask for the link), then stop.**
-2. **Re-validate before every session of writes.** Confirm the sheet is still
-   reachable and its tab/column structure still matches the template (a 404/403,
-   a renamed/moved sheet, or changed headers invalidates the tracker). If it has
-   drifted, do not write — explain and re-run setup.
-3. **Resolve the location.** Match the owner's words against the tracker's tab
-   names (case-insensitive; tolerate "storage"/"room"/floor typos). If ambiguous,
-   read the sheet list and confirm — don't guess.
-4. **Read current state:**
-   `GET https://gateway.maton.ai/google-sheets/v4/spreadsheets/{SHEET_ID}/values/{SHEET}!A2:B200`
-   (URL-encode the sheet name; keep the trailing space where present).
-5. **Match the item.** Normalize both sides (lowercase, strip, collapse
-   spaces). The template item names contain typos ("Quanity", "Applw Juice",
-   "Cranberry Jucie", "facuet"), so use substring/fuzzy matching — exact
-   substring first, then nearest edit distance. New item + no match → append a
-   row. Adjust + no match → ask which item they mean, don't guess.
-6. **Apply the change:**
-   - **Set** — "set X to N", "we have N X", "X is at N" → write N.
-   - **Add / receive** — "got N X", "N X arrived", "add N X", "delivered" →
-     `quantity += N`. Blank quantity counts as 0.
-   - **Use / remove** — "used N X", "take N X", "remove N X", "sold N X" →
-     `quantity -= N`, floor at 0.
-   - **Query** — "how many X", "what's in <location>", "running low", "report"
-     → read only, report. Treat blank quantity as 0.
-7. **Write back.** For an existing item, update column B:
-   `PUT https://gateway.maton.ai/google-sheets/v4/spreadsheets/{SHEET_ID}/values/{SHEET}!B{row}?valueInputOption=USER_ENTERED`
-   body `{"range": "{SHEET}!B{row}", "majorDimension": "ROWS", "values": [[<qty>]]}`.
-   For a new item, append:
-   `POST https://gateway.maton.ai/google-sheets/v4/spreadsheets/{SHEET_ID}/values/{SHEET}!A{nextRow}:append?valueInputOption=USER_ENTERED`
-   body `{"values": [[<item>, <qty>]]}`.
-8. **Verify.** Re-read the affected cell(s) and confirm the written value before
-   telling the owner it's done. Never report success from the write response
-   alone.
-
-## Errors & access problems
-
-If the request cannot be completed, say plainly why and what one thing is
-needed next — never guess and never half-apply:
-
-- **No linked sheet for the property** → run setup; ask for the Google Sheets
-  link from the approved template.
-- **Sheet inaccessible (403)** → reconnect in Settings → Integrations → Connect
-  Google.
-- **Link wrong / sheet moved (404)** → ask for a corrected link.
-- **Structure doesn't match the template** → explain which tab/column is off and
-  ask them to fix it (tabs and A/B columns must match the template).
-- **Ambiguous property/location/item** → ask one short clarifying question.
-
-## Success format
-
-One short line naming the property, location, item, and new quantity —
-"Sunrise Inn — Laundry Room: Bath Towels → 14 on hand." For a query, list item
-+ quantity per line. When asked what's low, flag anything at 0 or blank.
+Writing the owner's own linked, validated tracker at their direct request is
+the instruction — no separate strategic brief. Any outbound action (ordering,
+emailing a vendor) still follows the normal approval flow.
